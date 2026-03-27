@@ -13,11 +13,14 @@ find_package(pcl_conversions REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
-
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_sensor_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io segmentation filters)
 
 #executables:
-add_executable(ground_segmentation_node src/single_frame.cpp)
+add_executable(ground_segmentation_node src/ground_segmentation_node.cpp)
 add_executable(path_extraction_node src/path_extraction_node.cpp)
 
 
@@ -43,6 +46,10 @@ ament_target_dependencies(ground_segmentation_node
   rclcpp
   sensor_msgs
   pcl_conversions
+  tf2
+  tf2_ros
+  tf2_sensor_msgs
+  visualization_msgs
 )
 
 install(TARGETS
