@@ -1,0 +1,6 @@
+ground_segmentation_node:
+  ros__parameters:
+    distance_threshold: 0.08         # 8cm thickness tolerance
+    eps_angle_deg: 5.0               # RANSAC angle tolerance
+    max_acceptable_angle_deg: 5.0    # Final manual check tolerance
+    max_iterations: 200              # Optimization loops

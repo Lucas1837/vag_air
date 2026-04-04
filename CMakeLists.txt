@@ -16,23 +16,19 @@ find_package(Eigen3 REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_sensor_msgs REQUIRED)
-find_package(visualization_msgs REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io segmentation filters)
 
-#executables:
+# ==============================================================================
+# C++ EXECUTABLES
+# ==============================================================================
 add_executable(ground_segmentation_node src/ground_segmentation_node.cpp)
 add_executable(path_extraction_node src/path_extraction_node.cpp)
-
 
 target_include_directories(path_extraction_node PRIVATE ${PCL_INCLUDE_DIRS})
 target_link_libraries(path_extraction_node ${PCL_LIBRARIES} Eigen3::Eigen)
 
-target_include_directories(ground_segmentation_node PUBLIC
-  ${PCL_INCLUDE_DIRS}
-)
-target_link_libraries(ground_segmentation_node
-  ${PCL_LIBRARIES}
-)
+target_include_directories(ground_segmentation_node PUBLIC ${PCL_INCLUDE_DIRS})
+target_link_libraries(ground_segmentation_node ${PCL_LIBRARIES})
 
 ament_target_dependencies(path_extraction_node
   rclcpp
@@ -52,27 +48,32 @@ ament_target_dependencies(ground_segmentation_node
   visualization_msgs
 )
 
+# Install C++ Executables
 install(TARGETS
   ground_segmentation_node 
   path_extraction_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install launch, urdf, and meshes directories
+# ==============================================================================
+# PYTHON EXECUTABLES
+# ==============================================================================
+# Install Python scripts directly as PROGRAMS
+install(PROGRAMS
+  src/cam_fusion.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY
   launch
-  urdf
-  meshes
+  config
   DESTINATION share/${PROJECT_NAME}
 )
+
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()

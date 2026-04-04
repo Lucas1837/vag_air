@@ -8,6 +8,7 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "geometry_msgs/msg/point.hpp"
+#include "std_msgs/msg/float64.hpp"
 
 // PCL Headers
 #include <pcl_conversions/pcl_conversions.h>
@@ -37,7 +38,8 @@ public:
         marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/seed_bed_centerline", 10);
         lookahead_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/lookahead_error_visualization", 10);
         roi_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/roi_boundaries", 10);
-        error_publisher_ = this->create_publisher<geometry_msgs::msg::Point>("/error", 10);
+        
+        error_publisher_ = this->create_publisher<std_msgs::msg::Float64>("/error", 10);
         
         RCLCPP_INFO(this->get_logger(), "Path Extraction Node Started. Listening to /processed_pcd...");
     }
@@ -137,14 +139,12 @@ private:
         
         std::map<int, SliceData> slices;
 
-        // NEW: Flag to track if the entire point cloud is safely inside the ROI
         bool all_points_within_roi = true; 
 
         for (const auto& pt : cloud->points) {
             float forward_val = get_axis_val(pt, forward_axis_);
             float lateral_val = get_axis_val(pt, lateral_axis_);
 
-            // Check if any single point spills outside the 600mm bounds
             if (std::abs(lateral_val) > ROI_HALF_WIDTH ) {
                 all_points_within_roi = false;
             }
@@ -157,20 +157,17 @@ private:
         }
 
         // ==========================================
-        // NEW: The "Perfectly Straddled" Bypass Check
+        // The "Perfectly Straddled" Bypass Check
         // ==========================================
         if (all_points_within_roi) {
-            geometry_msgs::msg::Point error_msg;
-            error_msg.x = 0.0; // Zero horizontal error
-            error_msg.y = 0.0; // Zero angular error
-            error_msg.z = 0.0;
+            std_msgs::msg::Float64 error_msg;
+            error_msg.data = 0.0; 
             
             error_publisher_->publish(error_msg);
             
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                "Seedbed is perfectly within ROI. Driving straight (Error: 0.0)");
+                "Seedbed is perfectly within ROI. Driving straight (Angle Error: 0.0)");
             
-            // Return early! No need to draw lines or compute polynomials.
             return; 
         }
 
@@ -218,7 +215,7 @@ private:
         }
 
         // ==========================================
-        // Step 6: Polynomial Fit and Dynamic Error Calculation
+        // Step 6: Polynomial Fit and Fixed Error Calculation
         // ==========================================
         if (forward_vals.size() >= 3) { 
             Eigen::MatrixXd A(forward_vals.size(), 3);
@@ -236,57 +233,47 @@ private:
             double b = coeffs(1);
             double a = coeffs(2);
 
-            double lookahead_dist = 0.5; 
-            double target_forward = 0.0;
-            double horizontal_error = 0.0;
-
-            if (min_forward > lookahead_dist) {
-                target_forward = forward_vals[0]; 
-                horizontal_error = lateral_vals[0]; 
-            } else {
-                target_forward = lookahead_dist;
-                horizontal_error = (a * std::pow(target_forward, 2)) + (b * target_forward) + c;
-            }
-
-            if (target_forward <= 0.0) {
-                target_forward = 0.01; 
-                horizontal_error = (a * std::pow(target_forward, 2)) + (b * target_forward) + c;
-                RCLCPP_WARN(this->get_logger(), "Safety Gate: Negative forward axis detected! Clamped lookahead to > 0.");
-            }
-
+            // --- FIXED LOOKAHEAD DISTANCE ---
+            double target_forward = 2.0; 
+            
+            double horizontal_error = (a * std::pow(target_forward, 2)) + (b * target_forward) + c;
             double angle_error = std::atan2(horizontal_error, target_forward);
 
-            geometry_msgs::msg::Point error_msg;
-            error_msg.x = horizontal_error;
-            error_msg.y = angle_error;
-            error_msg.z = 0.0;
-
+            std_msgs::msg::Float64 error_msg;
+            error_msg.data = angle_error; 
+            
             error_publisher_->publish(error_msg);
 
             // ==========================================
-            // Step 7: Visualize the Lookahead Horizontal Error
+            // Step 7: Visualize the Lookahead as a Fixed Horizontal Line
             // ==========================================
             visualization_msgs::msg::Marker lookahead_marker;
             lookahead_marker.header = line_marker.header; 
-            lookahead_marker.ns = "lookahead";
+            lookahead_marker.ns = "lookahead_horizon";
             lookahead_marker.id = 1;
             lookahead_marker.type = visualization_msgs::msg::Marker::LINE_LIST; 
             lookahead_marker.action = visualization_msgs::msg::Marker::ADD;
             lookahead_marker.pose.orientation.w = 1.0; 
-            lookahead_marker.scale.x = 0.03; 
+            
+            // Set thickness to match ROI lines (0.02)
+            lookahead_marker.scale.x = 0.02; 
+            
+            // Bright Red to stand out
             lookahead_marker.color.r = 1.0f;
             lookahead_marker.color.g = 0.0f;
             lookahead_marker.color.b = 0.0f;
-            lookahead_marker.color.a = 1.0f;
+            lookahead_marker.color.a = 0.8f;
 
+            // Start of the line: Left boundary at 0.7m forward
             geometry_msgs::msg::Point p1; 
             set_axis_val(p1, height_axis_, 0.0f);
-            set_axis_val(p1, lateral_axis_, 0.0f); 
+            set_axis_val(p1, lateral_axis_, ROI_HALF_WIDTH); 
             set_axis_val(p1, forward_axis_, target_forward);
 
+            // End of the line: Right boundary at 0.7m forward
             geometry_msgs::msg::Point p2;
             set_axis_val(p2, height_axis_, 0.0f);
-            set_axis_val(p2, lateral_axis_, horizontal_error); 
+            set_axis_val(p2, lateral_axis_, -ROI_HALF_WIDTH); 
             set_axis_val(p2, forward_axis_, target_forward); 
 
             lookahead_marker.points.push_back(p1);
@@ -304,7 +291,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr lookahead_marker_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr roi_marker_publisher_;
-    rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr error_publisher_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr error_publisher_; 
 };
 
 int main(int argc, char * argv[])

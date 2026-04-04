@@ -11,7 +11,8 @@
 // TF2 Headers for PointCloud Transformation
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
-#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp" 
+#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
+#include "visualization_msgs/msg/marker.hpp" 
 #include <tf2/exceptions.h>
 
 // PCL Headers
@@ -45,18 +46,26 @@ public:
 
     GroundSegmentationNode() : Node("ground_segmentation_node")
     {   
+        // --- DECLARE ROS 2 PARAMETERS ---
+        this->declare_parameter<double>("distance_threshold", 0.03);
+        this->declare_parameter<double>("eps_angle_deg", 3.0);
+        this->declare_parameter<double>("max_acceptable_angle_deg", 2.0);
+        this->declare_parameter<int>("max_iterations", 200);
+        // --------------------------------
+
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            "/lidar/points", 10,
+            "/point_cloud", 10,
             std::bind(&GroundSegmentationNode::cloud_callback, this, std::placeholders::_1));
 
         publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/processed_pcd", 10);
         ground_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground_pcd", 10);
         tf_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/flat_pcd", 10);
         coeff_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/plane_coefficients", 10);
-         
+        plane_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/ground_plane_marker", 10);    
+        
         RCLCPP_INFO(this->get_logger(), "Ground Segmentation Node Started.");
     }
 
@@ -76,9 +85,16 @@ private:
         else if (axis == Axis::Z) pt.z = value;
     }
 
-    void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) const
+    void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) 
     {
         if (msg->data.empty() || msg->width * msg->height == 0) return;
+
+        // --- FETCH LATEST PARAMETER VALUES ---
+        double distance_threshold = this->get_parameter("distance_threshold").as_double();
+        double eps_angle_deg = this->get_parameter("eps_angle_deg").as_double();
+        double max_acceptable_angle_deg = this->get_parameter("max_acceptable_angle_deg").as_double();
+        int max_iterations = this->get_parameter("max_iterations").as_int();
+        // -------------------------------------
 
         sensor_msgs::msg::PointCloud2 flat_msg;
         try {
@@ -107,26 +123,27 @@ private:
         seg.setOptimizeCoefficients(false);
         seg.setModelType(pcl::SACMODEL_PARALLEL_PLANE); 
         seg.setMethodType(pcl::SAC_RANSAC);    
-        seg.setMaxIterations(200); 
-        seg.setDistanceThreshold(0.05); 
+        
+        // APPLY LIVE PARAMETERS
+        seg.setMaxIterations(max_iterations); 
+        seg.setDistanceThreshold(distance_threshold); 
+        seg.setEpsAngle(eps_angle_deg * (M_PI / 180.0)); 
 
         Eigen::Vector3f parallel_axis(1.0f, 1.0f, 1.0f);
         Eigen::Vector3f perpendicular_axis(0.0f, 0.0f, 0.0f);
         if (height_axis_ == Axis::Z) {
-        parallel_axis[2] = 0.0f;
-        perpendicular_axis[2]=1.0f;
+            parallel_axis[2] = 0.0f;
+            perpendicular_axis[2] = 1.0f;
         }
         else if (height_axis_ == Axis::Y){ 
-        parallel_axis[1] = 0.0f;
-        perpendicular_axis[1]=1.0f;
+            parallel_axis[1] = 0.0f;
+            perpendicular_axis[1] = 1.0f;
         }
         else if (height_axis_ == Axis::X){ 
-        parallel_axis[0] = 0.0f;
-        perpendicular_axis[0]=1.0f;
+            parallel_axis[0] = 0.0f;
+            perpendicular_axis[0] = 1.0f;
         }
         seg.setAxis(parallel_axis);
-
-        seg.setEpsAngle(3.0f * (M_PI / 180.0f)); 
 
         // ==========================================
         // DUAL-RANSAC IMPLEMENTATION
@@ -186,12 +203,10 @@ private:
                 ground_inliers = inliers2;
                 coefficients = coefficients2;
             } else {
-                RCLCPP_WARN(this->get_logger(), "No second frame found.");
                 ground_inliers = inliers1;
                 coefficients = coefficients1;
             }
         }
-        // ==========================================
         
         // ==========================================
         // MANUAL ANGLE VALIDATION
@@ -207,8 +222,8 @@ private:
         float dot_product = plane_normal.dot(perpendicular_axis);
         float angle_rad = std::acos(std::abs(dot_product));
         float angle_deg = angle_rad * (180.0f / M_PI);
-        float max_acceptable_angle_deg = 3.0f; 
 
+        // USE LIVE PARAMETER
         if (angle_deg > max_acceptable_angle_deg) {
             return; 
         }
@@ -221,6 +236,39 @@ private:
             coefficients->values[3]  
         };
         coeff_publisher_->publish(coeff_msg);
+
+        // ==========================================
+        // RVIZ2 PLANE VISUALIZATION MARKER
+        // ==========================================
+        visualization_msgs::msg::Marker plane_marker;
+        plane_marker.header.frame_id = target_frame_;
+        plane_marker.header.stamp = msg->header.stamp;
+        plane_marker.ns = "ground_plane";
+        plane_marker.id = 0;
+        plane_marker.type = visualization_msgs::msg::Marker::CUBE;
+        plane_marker.action = visualization_msgs::msg::Marker::ADD;
+
+        float d = coefficients->values[3];
+        plane_marker.pose.position.x = -d * plane_normal.x();
+        plane_marker.pose.position.y = -d * plane_normal.y();
+        plane_marker.pose.position.z = -d * plane_normal.z();
+
+        Eigen::Quaternionf q = Eigen::Quaternionf::FromTwoVectors(Eigen::Vector3f::UnitZ(), plane_normal);
+        plane_marker.pose.orientation.x = q.x();
+        plane_marker.pose.orientation.y = q.y();
+        plane_marker.pose.orientation.z = q.z();
+        plane_marker.pose.orientation.w = q.w();
+
+        plane_marker.scale.x = 10.0; 
+        plane_marker.scale.y = 10.0; 
+        plane_marker.scale.z = 0.01; 
+        
+        plane_marker.color.r = 0.0f;
+        plane_marker.color.g = 1.0f;
+        plane_marker.color.b = 0.0f;
+        plane_marker.color.a = 0.4f; 
+
+        plane_marker_publisher_->publish(plane_marker);
 
         // ==========================================
         // Extract and Publish the GROUND (Inliers)
@@ -321,7 +369,6 @@ private:
             
             std::map<int, std::pair<float, float>> boundary_map;
 
-            // 1. Build the dictionary based on the original seedbed points
             for (const auto& pt : final_target_object->points) {
                 float fwd_val = get_axis_val(pt, axis_forward);
                 float lat_val = get_axis_val(pt, axis_lateral);
@@ -335,13 +382,11 @@ private:
                 }
             }
 
-            // 2. Generate new points to fill the gaps and push them to filled_gaps_cloud
             for (const auto& kv : boundary_map) {
                 int fwd_bin = kv.first;
                 float min_lat = kv.second.first;
                 float max_lat = kv.second.second;
 
-                // Skip gap filling if the boundaries are closer than 10cm
                 if ((max_lat - min_lat) < 0.10f) {
                     continue; 
                 }
@@ -379,7 +424,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ground_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr tf_publisher_;
-    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr coeff_publisher_; 
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr coeff_publisher_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr plane_marker_publisher_; 
 };
 
 int main(int argc, char * argv[])
