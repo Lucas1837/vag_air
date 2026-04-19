@@ -1,0 +1,88 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-Debug-6d307cdc037a08231319.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "vitrox_project",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ground_segmentation_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ground_segmentation_node-Debug-bcc16de54e2265675b43.json",
+					"name" : "ground_segmentation_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "path_extraction_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-path_extraction_node-Debug-318fcd744238bba72eb6.json",
+					"name" : "path_extraction_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-Debug-a0d65f878d6d0117a9cf.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "vitrox_project_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-vitrox_project_uninstall-Debug-01e5f52099ecb9c04f4c.json",
+					"name" : "vitrox_project_uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/yujin/ros2_ws/src/vitrox_project/build",
+		"source" : "/home/yujin/ros2_ws/src/vitrox_project"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

@@ -1,0 +1,4 @@
+source;share/vitrox_project/local_setup.bash
+source;share/vitrox_project/local_setup.dsv
+source;share/vitrox_project/local_setup.sh
+source;share/vitrox_project/local_setup.zsh

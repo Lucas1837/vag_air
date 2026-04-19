@@ -7,10 +7,16 @@ def generate_launch_description():
     package_name = 'vitrox_project'
 
     # Path to your parameter file
-    config = os.path.join(
+    config1 = os.path.join(
         get_package_share_directory(package_name),
         'config',
         'segmentation_params.yaml'
+    )
+
+    config2 = os.path.join(
+        get_package_share_directory(package_name),
+        'config',
+        'path.yaml'
     )
 
     return LaunchDescription([
@@ -20,7 +26,7 @@ def generate_launch_description():
             executable='ground_segmentation_node',
             name='ground_segmentation_node',
             output='screen',
-            parameters=[config]  # Loading the YAML file
+            parameters=[config1]  # Loading the YAML file
         ),
         
         # 2. Path Extraction Node (C++)
@@ -28,7 +34,8 @@ def generate_launch_description():
             package=package_name,
             executable='path_extraction_node',
             name='path_extraction_node',
-            output='screen'
+            output='screen',
+            parameters=[config2]
         ),
         
         # 3. Camera Fusion Node (Python)

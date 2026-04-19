@@ -2,15 +2,13 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 import message_filters
 
 # TF2 imports
 from tf2_ros import Buffer, TransformListener, TransformException
 
-# Point cloud and math utilities
-import sensor_msgs_py.point_cloud2 as pc2
 import numpy as np
 
 class CameraFusionNode(Node):
@@ -32,40 +30,49 @@ class CameraFusionNode(Node):
         )
         self.ts.registerCallback(self.sync_callback)
 
-        self.get_logger().info("Camera Fusion Node Started. Waiting for point clouds...")
+        self.get_logger().info("Lightning Camera Fusion Node Started. Waiting for point clouds...")
 
     def extract_xyz(self, cloud_msg):
-        """Safely extracts x, y, z from a PointCloud2 message into a standard Nx3 numpy array."""
-        # Read the points (without forcing float32 yet)
-        pts = np.array(list(pc2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True)))
-        
-        if pts.size == 0:
+        """Extracts X, Y, Z instantly using native memory buffers."""
+        if len(cloud_msg.data) == 0:
             return np.empty((0, 3), dtype=np.float32)
-            
-        # Check if ROS returned a structured array (with labels 'x', 'y', 'z')
-        if pts.dtype.names is not None:
-            # Strip the labels and stack them side-by-side into raw numbers
-            pts = np.column_stack((pts['x'], pts['y'], pts['z']))
+
+        # Dynamically find the byte offsets for safety
+        x_offset = next((f.offset for f in cloud_msg.fields if f.name == 'x'), 0)
+        y_offset = next((f.offset for f in cloud_msg.fields if f.name == 'y'), 4)
+        z_offset = next((f.offset for f in cloud_msg.fields if f.name == 'z'), 8)
+
+        # Create a dtype to instantly map the raw binary array
+        dtype = np.dtype({
+            'names': ['x', 'y', 'z'],
+            'formats': ['<f4', '<f4', '<f4'],
+            'offsets': [x_offset, y_offset, z_offset],
+            'itemsize': cloud_msg.point_step
+        })
+
+        pts = np.frombuffer(cloud_msg.data, dtype=dtype)
         
-        # Ensure it is standard N x 3 float array
-        return pts.astype(np.float32).reshape(-1, 3)
+        # Filter out NaN values efficiently
+        valid_mask = ~np.isnan(pts['x']) & ~np.isnan(pts['y']) & ~np.isnan(pts['z'])
+        pts = pts[valid_mask]
+
+        return np.column_stack((pts['x'], pts['y'], pts['z']))
 
     def transform_numpy_array(self, points, transform_msg):
-        """Applies a ROS TransformStamped to an Nx3 numpy array manually."""
+        """Applies a ROS TransformStamped to an Nx3 numpy array."""
         t = transform_msg.transform.translation
         q = transform_msg.transform.rotation
 
         translation = np.array([t.x, t.y, t.z])
-
         x, y, z, w = q.x, q.y, q.z, q.w
+        
         rotation_matrix = np.array([
             [1 - 2*(y**2 + z**2),     2*(x*y - w*z),     2*(x*z + w*y)],
             [    2*(x*y + w*z), 1 - 2*(x**2 + z**2),     2*(y*z - w*x)],
             [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
         ])
 
-        transformed_points = np.dot(points, rotation_matrix.T) + translation
-        return transformed_points
+        return np.dot(points, rotation_matrix.T) + translation
 
     def sync_callback(self, msg_l, msg_r):
         target_frame = 'base_link'
@@ -79,7 +86,7 @@ class CameraFusionNode(Node):
                 target_frame, msg_r.header.frame_id, rclpy.time.Time()
             )
 
-            # 2. Safely extract only X, Y, Z into standard numpy arrays
+            # 2. Extract instantly via memory buffer
             points_l = self.extract_xyz(msg_l)
             points_r = self.extract_xyz(msg_r)
 
@@ -93,21 +100,33 @@ class CameraFusionNode(Node):
             # 4. Append the two point clouds together
             all_points = np.vstack((points_l_tf, points_r_tf))
 
-            # 5. Filter out "repeating" points (1cm resolution grid)
-            precision_decimals = 2 
-            rounded_points = np.round(all_points, decimals=precision_decimals)
-            _, unique_indices = np.unique(rounded_points, axis=0, return_index=True)
-            filtered_points = all_points[unique_indices]
+            # 5. Fast Voxel Grid Downsampling (Much faster than float rounding)
+            voxel_size = 0.02 # 2cm resolution
+            voxels = np.floor(all_points / voxel_size).astype(np.int32)
+            _, unique_indices = np.unique(voxels, axis=0, return_index=True)
+            filtered_points = all_points[unique_indices].astype(np.float32)
 
-            # 6. Create the new fused PointCloud2 message
-            header = Header()
-            header.stamp = msg_l.header.stamp  # <-- Inherit the exact time from the Lidar
-            header.frame_id = target_frame
+            # 6. Create the fused message instantly via .tobytes()
+            fused_msg = PointCloud2()
+            fused_msg.header.stamp = msg_l.header.stamp
+            fused_msg.header.frame_id = target_frame
+            fused_msg.height = 1
+            fused_msg.width = filtered_points.shape[0]
+            fused_msg.fields = [
+                PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)
+            ]
+            fused_msg.is_bigendian = False
+            fused_msg.point_step = 12  # 3 floats * 4 bytes
+            fused_msg.row_step = fused_msg.point_step * fused_msg.width
+            fused_msg.is_dense = True
             
-            fused_cloud_msg = pc2.create_cloud_xyz32(header, filtered_points.tolist())
+            # Map raw binary array straight to message payload
+            fused_msg.data = filtered_points.tobytes()
 
             # 7. Publish
-            self.pc_pub.publish(fused_cloud_msg)
+            self.pc_pub.publish(fused_msg)
 
         except TransformException as ex:
             self.get_logger().warn(f'Could not transform point clouds: {ex}')

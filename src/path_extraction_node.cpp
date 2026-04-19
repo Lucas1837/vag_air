@@ -1,303 +1,228 @@
 #include <memory>
 #include <vector>
-#include <map>
 #include <cmath>
-#include <algorithm>
-#include <Eigen/Dense> 
+#include <numeric>
+#include <limits>
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include <std_msgs/msg/float64.hpp>
 #include "visualization_msgs/msg/marker.hpp"
-#include "geometry_msgs/msg/point.hpp"
-#include "std_msgs/msg/float64.hpp"
 
 // PCL Headers
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl/common/common.h> 
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/statistical_outlier_removal.h>
 
-class PathExtractionNode : public rclcpp::Node
+class TargetBandExtractionNode : public rclcpp::Node
 {
 public:
-    // ==========================================
-    // MODULAR CONFIGURATION
-    // ==========================================
-    enum class Axis { X, Y, Z };
-
-    // Standard ROS 2 base_link frame conventions:
-    Axis forward_axis_ = Axis::X; // The axis pointing forward into the distance
-    Axis lateral_axis_ = Axis::Y; // The horizontal left/right axis
-    Axis height_axis_  = Axis::Z; // The vertical up/down axis (flattened to 0)
-
-    PathExtractionNode() : Node("path_extraction_node")
+    TargetBandExtractionNode() : Node("target_band_extraction_node")
     {
+        // --- System Parameters ---
+        this->declare_parameter<double>("lookahead_distance", 1.50);        
+        this->declare_parameter<double>("lookahead_window_thickness", 0.15); // Box depth
+        this->declare_parameter<double>("search_width", 1.20);               // Visual width of the RViz box
+        this->declare_parameter<int>("moving_avg_window", 10);              
+        
         subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             "/processed_pcd", 10,
-            std::bind(&PathExtractionNode::cloud_callback, this, std::placeholders::_1));
+            std::bind(&TargetBandExtractionNode::cloud_callback, this, std::placeholders::_1));
 
-        marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/seed_bed_centerline", 10);
-        lookahead_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/lookahead_error_visualization", 10);
-        roi_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/roi_boundaries", 10);
+        marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/steering_vector", 10);
+        box_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/lookahead_box", 10);
+        error_publisher_ = this->create_publisher<std_msgs::msg::Float64>("/lookahead_angle", 10);
         
-        error_publisher_ = this->create_publisher<std_msgs::msg::Float64>("/error", 10);
-        
-        RCLCPP_INFO(this->get_logger(), "Path Extraction Node Started. Listening to /processed_pcd...");
+        RCLCPP_INFO(this->get_logger(), "Dynamic Box Extraction Node Started (Curve-Safe).");
     }
 
 private:
-    // --- Helper Functions to make axes modular ---
-    inline float get_axis_val(const pcl::PointXYZ& pt, Axis axis) const {
-        if (axis == Axis::X) return pt.x;
-        if (axis == Axis::Y) return pt.y;
-        return pt.z;
-    }
+    std::vector<double> angle_error_buffer_;
+    std::vector<double> horizontal_error_buffer_;
 
-    inline void set_axis_val(pcl::PointXYZ& pt, Axis axis, float value) const {
-        if (axis == Axis::X) pt.x = value;
-        else if (axis == Axis::Y) pt.y = value;
-        else if (axis == Axis::Z) pt.z = value;
-    }
+    void publish_straight_command(const std::string& reason) 
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+            "Gap lost (%s). Commanding robot to go STRAIGHT.", reason.c_str());
+            
+        std_msgs::msg::Float64 error_msg; 
+        error_msg.data = 0.0;      
+        error_publisher_->publish(error_msg);
 
-    inline void set_axis_val(geometry_msgs::msg::Point& pt, Axis axis, float value) const {
-        if (axis == Axis::X) pt.x = value;
-        else if (axis == Axis::Y) pt.y = value;
-        else if (axis == Axis::Z) pt.z = value;
+        horizontal_error_buffer_.clear();
+        angle_error_buffer_.clear();
     }
-    // ---------------------------------------------
 
     void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) 
     {
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
-        pcl::fromROSMsg(*msg, *cloud);
+        double target_dist = this->get_parameter("lookahead_distance").as_double();
+        double thickness = this->get_parameter("lookahead_window_thickness").as_double();
+        double search_width = this->get_parameter("search_width").as_double();
+        size_t window_size = this->get_parameter("moving_avg_window").as_int();
 
-        if (cloud->points.empty()) return;
+        double min_x = target_dist - (thickness / 2.0);
+        double max_x = target_dist + (thickness / 2.0);
 
-        // Step 1: Find the nearest and farthest limits of the seed bed
-        pcl::PointXYZ min_pt, max_pt;
-        pcl::getMinMax3D(*cloud, min_pt, max_pt);
-        
-        float min_forward = get_axis_val(min_pt, forward_axis_);
-        float max_forward = get_axis_val(max_pt, forward_axis_);
+        pcl::PointCloud<pcl::PointXYZ>::Ptr raw_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::fromROSMsg(*msg, *raw_cloud);
 
-        // ==========================================
-        // Visualize Region of Interest (ROI) Boundaries
-        // ==========================================
-        const float ROI_HALF_WIDTH = 0.6f;
+        if (raw_cloud->points.empty()) {
+            publish_straight_command("Empty raw cloud");
+            return;
+        }
 
-        visualization_msgs::msg::Marker roi_marker;
-        roi_marker.header = msg->header;
-        if (roi_marker.header.frame_id.empty()) roi_marker.header.frame_id = "base_link";
-        
-        roi_marker.ns = "roi_bounds";
-        roi_marker.id = 2;
-        roi_marker.type = visualization_msgs::msg::Marker::LINE_LIST;
-        roi_marker.action = visualization_msgs::msg::Marker::ADD;
-        roi_marker.pose.orientation.w = 1.0;
-        roi_marker.scale.x = 0.02; // 2cm thick lines
-        roi_marker.color.r = 0.0f;
-        roi_marker.color.g = 1.0f; // Bright green
-        roi_marker.color.b = 0.0f;
-        roi_marker.color.a = 0.8f;
+        // 1. Draw the Lookahead Search Box in RViz
+        publish_search_box(msg->header, min_x, max_x, search_width);
 
-        // Left Boundary Line
-        geometry_msgs::msg::Point left_start, left_end;
-        set_axis_val(left_start, lateral_axis_, ROI_HALF_WIDTH);
-        set_axis_val(left_start, forward_axis_, min_forward);
-        set_axis_val(left_start, height_axis_, 0.0f);
-        
-        set_axis_val(left_end, lateral_axis_, ROI_HALF_WIDTH);
-        set_axis_val(left_end, forward_axis_, max_forward);
-        set_axis_val(left_end, height_axis_, 0.0f);
-        
-        // Right Boundary Line
-        geometry_msgs::msg::Point right_start, right_end;
-        set_axis_val(right_start, lateral_axis_, -ROI_HALF_WIDTH);
-        set_axis_val(right_start, forward_axis_, min_forward);
-        set_axis_val(right_start, height_axis_, 0.0f);
-        
-        set_axis_val(right_end, lateral_axis_, -ROI_HALF_WIDTH);
-        set_axis_val(right_end, forward_axis_, max_forward);
-        set_axis_val(right_end, height_axis_, 0.0f);
+        // 2. Crop Cloud EXACTLY to the X-axis target band (The Box)
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cropped_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::PassThrough<pcl::PointXYZ> pass_x;
+        pass_x.setInputCloud(raw_cloud);
+        pass_x.setFilterFieldName("x"); 
+        pass_x.setFilterLimits(min_x, max_x); 
+        pass_x.filter(*cropped_cloud);
 
-        roi_marker.points.push_back(left_start);
-        roi_marker.points.push_back(left_end);
-        roi_marker.points.push_back(right_start);
-        roi_marker.points.push_back(right_end);
+        // NOTICE: The Y-axis PassThrough filter has been completely removed! 
+        // The robot can now track sharp curves outside the center.
 
-        roi_marker_publisher_->publish(roi_marker);
+        if (cropped_cloud->points.empty()) {
+            publish_straight_command("No ground found inside the lookahead box");
+            return;
+        }
 
-        // ==========================================
-        // Step 2 & 3: Divide the region and check ROI inclusion
-        // ==========================================
-        const float SLICE_THICKNESS = 0.05f; 
-        
-        struct SliceData {
-            float sum_lateral = 0.0f;
-            int count = 0;
-            float center_forward = 0.0f;
-        };
-        
-        std::map<int, SliceData> slices;
+        // 3. Noise Filtering
+        pcl::PointCloud<pcl::PointXYZ>::Ptr clean_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+        sor.setInputCloud(cropped_cloud);
+        sor.setMeanK(10);             
+        sor.setStddevMulThresh(1.0);  
+        sor.filter(*clean_cloud);
 
-        bool all_points_within_roi = true; 
-
-        for (const auto& pt : cloud->points) {
-            float forward_val = get_axis_val(pt, forward_axis_);
-            float lateral_val = get_axis_val(pt, lateral_axis_);
-
-            if (std::abs(lateral_val) > ROI_HALF_WIDTH ) {
-                all_points_within_roi = false;
-            }
-
-            int slice_index = std::floor((forward_val - min_forward) / SLICE_THICKNESS);
-            
-            slices[slice_index].sum_lateral += lateral_val; 
-            slices[slice_index].count += 1;
-            slices[slice_index].center_forward = min_forward + (slice_index * SLICE_THICKNESS) + (SLICE_THICKNESS / 2.0f);
+        if (clean_cloud->points.empty()) {
+            publish_straight_command("Cloud empty after noise filtering");
+            return;
         }
 
         // ==========================================
-        // The "Perfectly Straddled" Bypass Check
+        // 4. FIND THE TRUE MIDPOINT OF THE GROUND
         // ==========================================
-        if (all_points_within_roi) {
-            std_msgs::msg::Float64 error_msg;
-            error_msg.data = 0.0; 
-            
-            error_publisher_->publish(error_msg);
-            
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                "Seedbed is perfectly within ROI. Driving straight (Angle Error: 0.0)");
-            
-            return; 
+        double min_y = std::numeric_limits<double>::max();
+        double max_y = -std::numeric_limits<double>::max();
+
+        // Scan all ground points in the box to find the physical boundaries
+        for (const auto& pt : clean_cloud->points) {
+            if (pt.y < min_y) min_y = pt.y;
+            if (pt.y > max_y) max_y = pt.y;
         }
 
-        // Step 4: Prepare the RViz2 Marker for center line
-        visualization_msgs::msg::Marker line_marker;
-        line_marker.header = msg->header; 
-        
-        if (line_marker.header.frame_id.empty()) {
-            line_marker.header.frame_id = "base_link"; 
-        }
+        // The center of the path is exactly between the furthest left and furthest right ground points
+        double target_y = (min_y + max_y) / 2.0;
 
-        line_marker.ns = "centerline";
-        line_marker.id = 0;
-        line_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-        line_marker.action = visualization_msgs::msg::Marker::ADD;
-        line_marker.pose.orientation.w = 1.0; 
-        line_marker.scale.x = 0.03; 
-        line_marker.color.r = 0.0f;
-        line_marker.color.g = 0.0f;
-        line_marker.color.b = 1.0f;
-        line_marker.color.a = 1.0f; 
-
-        std::vector<double> forward_vals;
-        std::vector<double> lateral_vals;
-
-        // Step 5: Calculate the final lateral centroid for each rectangle
-        for (auto const& [index, data] : slices) {
-            if (data.count < 1) continue; 
-
-            float avg_lateral = data.sum_lateral / data.count;
-
-            forward_vals.push_back(data.center_forward);
-            lateral_vals.push_back(avg_lateral);
-
-            geometry_msgs::msg::Point p;
-            set_axis_val(p, height_axis_, 0.0f);         
-            set_axis_val(p, lateral_axis_, avg_lateral); 
-            set_axis_val(p, forward_axis_, data.center_forward); 
-
-            line_marker.points.push_back(p);
-        }
-
-        if (!line_marker.points.empty()) {
-            marker_publisher_->publish(line_marker);
-        }
+        // Calculate Angle (Reversed Direction: Left=Negative, Right=Positive)
+        double angle_rad = std::atan2(target_y, target_dist);
 
         // ==========================================
-        // Step 6: Polynomial Fit and Fixed Error Calculation
+        // 5. STABILIZE AND PUBLISH
         // ==========================================
-        if (forward_vals.size() >= 3) { 
-            Eigen::MatrixXd A(forward_vals.size(), 3);
-            Eigen::VectorXd B(lateral_vals.size());
+        horizontal_error_buffer_.push_back(target_y);
+        angle_error_buffer_.push_back(angle_rad);
 
-            for (size_t i = 0; i < forward_vals.size(); ++i) {
-                A(i, 0) = 1.0; 
-                A(i, 1) = forward_vals[i]; 
-                A(i, 2) = std::pow(forward_vals[i], 2); 
-                B(i) = lateral_vals[i]; 
-            }
+        if (horizontal_error_buffer_.size() > window_size) {
+            horizontal_error_buffer_.erase(horizontal_error_buffer_.begin());
+            angle_error_buffer_.erase(angle_error_buffer_.begin());
+        }
 
-            Eigen::VectorXd coeffs = A.householderQr().solve(B);
-            double c = coeffs(0);
-            double b = coeffs(1);
-            double a = coeffs(2);
+        double smooth_horizontal_error = std::accumulate(horizontal_error_buffer_.begin(), horizontal_error_buffer_.end(), 0.0) / horizontal_error_buffer_.size();
+        double smooth_angle_error = std::accumulate(angle_error_buffer_.begin(), angle_error_buffer_.end(), 0.0) / angle_error_buffer_.size();
 
-            // --- FIXED LOOKAHEAD DISTANCE ---
-            double target_forward = 2.0; 
-            
-            double horizontal_error = (a * std::pow(target_forward, 2)) + (b * target_forward) + c;
-            double angle_error = std::atan2(horizontal_error, target_forward);
+        std_msgs::msg::Float64 error_msg; 
+        error_msg.data = smooth_angle_error;      
+        error_publisher_->publish(error_msg);
 
-            std_msgs::msg::Float64 error_msg;
-            error_msg.data = angle_error; 
-            
-            error_publisher_->publish(error_msg);
-
-            // ==========================================
-            // Step 7: Visualize the Lookahead as a Fixed Horizontal Line
-            // ==========================================
-            visualization_msgs::msg::Marker lookahead_marker;
-            lookahead_marker.header = line_marker.header; 
-            lookahead_marker.ns = "lookahead_horizon";
-            lookahead_marker.id = 1;
-            lookahead_marker.type = visualization_msgs::msg::Marker::LINE_LIST; 
-            lookahead_marker.action = visualization_msgs::msg::Marker::ADD;
-            lookahead_marker.pose.orientation.w = 1.0; 
-            
-            // Set thickness to match ROI lines (0.02)
-            lookahead_marker.scale.x = 0.02; 
-            
-            // Bright Red to stand out
-            lookahead_marker.color.r = 1.0f;
-            lookahead_marker.color.g = 0.0f;
-            lookahead_marker.color.b = 0.0f;
-            lookahead_marker.color.a = 0.8f;
-
-            // Start of the line: Left boundary at 0.7m forward
-            geometry_msgs::msg::Point p1; 
-            set_axis_val(p1, height_axis_, 0.0f);
-            set_axis_val(p1, lateral_axis_, ROI_HALF_WIDTH); 
-            set_axis_val(p1, forward_axis_, target_forward);
-
-            // End of the line: Right boundary at 0.7m forward
-            geometry_msgs::msg::Point p2;
-            set_axis_val(p2, height_axis_, 0.0f);
-            set_axis_val(p2, lateral_axis_, -ROI_HALF_WIDTH); 
-            set_axis_val(p2, forward_axis_, target_forward); 
-
-            lookahead_marker.points.push_back(p1);
-            lookahead_marker.points.push_back(p2);
-
-            lookahead_marker_publisher_->publish(lookahead_marker);
-            
+        // Terminal Printouts
+        double angle_deg = smooth_angle_error * (180.0 / M_PI);
+        if (std::abs(smooth_horizontal_error) <= 0.03) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+                "[STRAIGHT] Centered in curve. Angle: %.2f deg", angle_deg);
+        } else if (smooth_horizontal_error > 0.03) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+                "[STEER LEFT]  Path center is %.2fm left. Angle: %.2f deg", smooth_horizontal_error, angle_deg);
         } else {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                "Not enough valid slices to compute polynomial curve! Found: %zu, Required: 3", forward_vals.size());
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+                "[STEER RIGHT] Path center is %.2fm right. Angle: %.2f deg", std::abs(smooth_horizontal_error), angle_deg);
         }
+
+        // Draw the steering vector pointing to the dynamically found midpoint
+        publish_steering_vector(msg->header, target_dist, target_y);
+    }
+
+    void publish_search_box(std_msgs::msg::Header header, double min_x, double max_x, double search_width) {
+        visualization_msgs::msg::Marker box_marker;
+        box_marker.header = header;
+        if (box_marker.header.frame_id.empty()) box_marker.header.frame_id = "base_link";
+        
+        box_marker.ns = "search_box";
+        box_marker.id = 1;
+        box_marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+        box_marker.action = visualization_msgs::msg::Marker::ADD;
+        box_marker.pose.orientation.w = 1.0;
+        box_marker.scale.x = 0.02; 
+        box_marker.color.r = 0.0f; box_marker.color.g = 1.0f; box_marker.color.b = 0.0f; box_marker.color.a = 0.8f; 
+
+        geometry_msgs::msg::Point p1, p2, p3, p4;
+        p1.z = p2.z = p3.z = p4.z = 0.0;
+
+        // Front edge
+        p1.x = max_x; p1.y = search_width;  p2.x = max_x; p2.y = -search_width;
+        box_marker.points.push_back(p1); box_marker.points.push_back(p2);
+        // Back edge
+        p3.x = min_x; p3.y = search_width;  p4.x = min_x; p4.y = -search_width;
+        box_marker.points.push_back(p3); box_marker.points.push_back(p4);
+        // Left edge
+        box_marker.points.push_back(p1); box_marker.points.push_back(p3);
+        // Right edge
+        box_marker.points.push_back(p2); box_marker.points.push_back(p4);
+
+        box_marker_publisher_->publish(box_marker);
+    }
+
+    void publish_steering_vector(std_msgs::msg::Header header, double target_x, double target_y)
+    {
+        if (header.frame_id.empty()) header.frame_id = "base_link";
+
+        visualization_msgs::msg::Marker vector_marker;
+        vector_marker.header = header;
+        vector_marker.ns = "steering_vector";
+        vector_marker.id = 2;
+        vector_marker.type = visualization_msgs::msg::Marker::ARROW;
+        vector_marker.action = visualization_msgs::msg::Marker::ADD;
+        
+        geometry_msgs::msg::Point start, end;
+        start.x = 0.0; start.y = 0.0; start.z = 0.0;
+        end.x = target_x; end.y = target_y; end.z = 0.0;
+        
+        vector_marker.points.push_back(start);
+        vector_marker.points.push_back(end);
+
+        vector_marker.scale.x = 0.05; 
+        vector_marker.scale.y = 0.10; 
+        vector_marker.scale.z = 0.10; 
+        vector_marker.color.r = 1.0f; vector_marker.color.g = 1.0f; vector_marker.color.b = 0.0f; vector_marker.color.a = 1.0f; 
+
+        marker_publisher_->publish(vector_marker);
     }
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_publisher_;
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr lookahead_marker_publisher_;
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr roi_marker_publisher_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr error_publisher_; 
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr box_marker_publisher_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr error_publisher_;
 };
 
 int main(int argc, char * argv[])
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PathExtractionNode>());
+    rclcpp::spin(std::make_shared<TargetBandExtractionNode>());
     rclcpp::shutdown();
     return 0;
 }

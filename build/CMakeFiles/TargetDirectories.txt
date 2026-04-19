@@ -1,0 +1,11 @@
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/uninstall.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/vitrox_project_uninstall.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/ground_segmentation_node.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/path_extraction_node.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/test.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/edit_cache.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/rebuild_cache.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/list_install_components.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/install.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/install/local.dir
+/home/yujin/ros2_ws/src/vitrox_project/build/CMakeFiles/install/strip.dir
