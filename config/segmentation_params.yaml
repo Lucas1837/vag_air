@@ -1,7 +1,10 @@
 ground_segmentation_node:
   ros__parameters:
+    leaf_size: 0.02
     distance_threshold: 0.04         # 8cm thickness tolerance
     eps_angle_deg: 1.0               # RANSAC angle tolerance
     max_acceptable_angle_deg: 1.0    # Final manual check tolerance
-    max_iterations: 300              # Optimization loops
+    max_iterations: 300
+    sor_mean_k: 5.0      #the amount of point to include to declare the point as inlier, the greater, the stricter 
+    sor_std:1: 10         #distance standard deviation , the lower the stricter
 

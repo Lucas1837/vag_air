@@ -2,7 +2,7 @@ path_extraction_node:
   ros__parameters:
     lookahead_min: 0.3          # Bring the start box much closer to the robot
     lookahead_max: 3.0          # Push the end box much further out
-    lookahead_dist: 1.7
+    lookahead_dist: 1.3
     roi_half_width: 0.45        # Widen the corridor to 0.9m
     min_points_per_slice: 2      # Lower the threshold so sparse data is still accepted
     slice_thickness: 0.10        # Make the slices thicker (10cm) to catch more points

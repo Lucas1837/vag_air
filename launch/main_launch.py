@@ -20,7 +20,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        # 1. Ground Segmentation Node (C++)
+        # 1. Ground Segmentation Node 
         Node(
             package=package_name,
             executable='ground_segmentation_node',
@@ -29,7 +29,7 @@ def generate_launch_description():
             parameters=[config1]  # Loading the YAML file
         ),
         
-        # 2. Path Extraction Node (C++)
+        # 2. Path Extraction Node 
         Node(
             package=package_name,
             executable='path_extraction_node',
@@ -38,10 +38,10 @@ def generate_launch_description():
             parameters=[config2]
         ),
         
-        # 3. Camera Fusion Node (Python)
+        # 3. Camera Fusion Node 
         Node(
             package=package_name,
-            executable='cam_fusion.py', # Ensure this matches how it's installed in CMakeLists
+            executable='cam_fusion_node', # Ensure this matches how it's installed in CMakeLists
             name='cam_fusion_node',
             output='screen'
         )
