@@ -1,81 +1,79 @@
 #include <memory>
-#include <limits>
 #include <vector>
 #include <cmath>
-#include <string>
 #include <map>
+#include <algorithm>
+#include <numeric>
+#include <unordered_set> 
+
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
-#include "std_msgs/msg/float32_multi_array.hpp"
+#include "geometry_msgs/msg/point.hpp"             
 
-// TF2 Headers
-#include "tf2_ros/buffer.h"
-#include "tf2_ros/transform_listener.h"
-#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
-#include "visualization_msgs/msg/marker.hpp" 
-#include <tf2/exceptions.h>
-#include <tf2_eigen/tf2_eigen.hpp> 
-
-// PCL Headers
-#include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl/ModelCoefficients.h>
-#include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/filters/extract_indices.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/passthrough.h> 
-#include <pcl/filters/statistical_outlier_removal.h> 
-#include <pcl/common/transforms.h>   
+#include <pcl_conversions/pcl_conversions.h>
 
-#include <Eigen/Dense>
-#include <Eigen/Geometry> 
-
-class GroundSegmentationNode : public rclcpp::Node
+class SeedbedSegmentationNode : public rclcpp::Node
 {
 public:
     enum class Axis { X, Y, Z };
-
-    // Standard ROS conventions for base_link
     Axis height_axis_ = Axis::Z;  
     Axis lateral_axis_ = Axis::Y; 
-    
-    std::string target_frame_ = "base_link"; 
 
-    GroundSegmentationNode() : Node("ground_segmentation_node")
-    {   
-        // Parameters
-        this->declare_parameter<double>("distance_threshold", 0.03);
-        this->declare_parameter<double>("eps_angle_deg", 3.0);
-        this->declare_parameter<double>("max_acceptable_angle_deg", 2.0);
-        this->declare_parameter<int>("max_iterations", 200);
-        this->declare_parameter<double>("sor_mean_k", 10);
-        this->declare_parameter<double>("sor_std", 1);
+    SeedbedSegmentationNode() : Node("seedbed_segmentation_node")
+    {
+        normal_k_search_ = this->declare_parameter<int>("normal_k_search", 30);
+        y_normal_tolerance_ = this->declare_parameter<double>("y_normal_tolerance", 0.7); 
+        
+        min_lateral_y_ = this->declare_parameter<double>("min_lateral_y", -0.60);
+        max_lateral_y_ = this->declare_parameter<double>("max_lateral_y", 0.60);
+
+        max_wall_height_ = this->declare_parameter<double>("max_wall_height", 0.35);
+        min_wall_height_ = this->declare_parameter<double>("min_wall_height", 0.05);
+        veto_grid_res_ = this->declare_parameter<double>("veto_grid_res", 0.10); 
+
+        sor_mean_k_ = this->declare_parameter<int>("sor_mean_k", 50);
+        sor_stddev_mul_thresh_ = this->declare_parameter<double>("sor_stddev_mul_thresh", 1.0);
+        y_z_score_threshold_ = this->declare_parameter<double>("y_z_score_threshold", 1.6);
+        fill_resolution_ = this->declare_parameter<double>("fill_resolution", 0.08);
+
+        param_cb_ = this->add_on_set_parameters_callback(
+            std::bind(&SeedbedSegmentationNode::onParamChange, this, std::placeholders::_1));
 
         rclcpp::QoS best_effort_qos = rclcpp::QoS(10).best_effort();
 
-        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            "/point_cloud", best_effort_qos, 
+            std::bind(&SeedbedSegmentationNode::cloudCallback, this, std::placeholders::_1));
 
-
-        subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            "/point_cloud", best_effort_qos,
-            std::bind(&GroundSegmentationNode::cloud_callback, this, std::placeholders::_1));
-
-        publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/processed_pcd", 10);
-        ground_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground_pcd", 10);
-        tf_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/flat_pcd", 10);
-        coeff_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/plane_coefficients", 10);
-        plane_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("/ground_plane_marker", 10);    
+        pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/processed_pcd", best_effort_qos);
+        debug_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/debug_walls_3d", best_effort_qos);
         
-        // --- NEW PUBLISHER FOR DEBUGGING ---
-        flat_2d_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/debug_flat_2d_pcd", 10);
-        
-        RCLCPP_INFO(this->get_logger(), "Optimized Ground Segmentation Node Started.");
+        RCLCPP_INFO(this->get_logger(), "Ground Segmentation Node Started.");
     }
 
 private:
-    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    int normal_k_search_;
+    double y_normal_tolerance_;
+    double min_lateral_y_; 
+    double max_lateral_y_; 
+    double max_wall_height_;
+    double min_wall_height_; 
+    double veto_grid_res_;
+    int sor_mean_k_;
+    double sor_stddev_mul_thresh_;
+    double y_z_score_threshold_; 
+    double fill_resolution_; 
+
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_pub_;
 
     inline float get_axis_val(const pcl::PointXYZ& pt, Axis axis) const {
         if (axis == Axis::X) return pt.x;
@@ -89,205 +87,183 @@ private:
         else if (axis == Axis::Z) pt.z = value;
     }
 
-    void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) 
+    rcl_interfaces::msg::SetParametersResult onParamChange(const std::vector<rclcpp::Parameter> &parameters)
     {
-        if (msg->data.empty() || msg->width * msg->height == 0) return;
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = true;
+        for (const auto &param : parameters) {
+            if (param.get_name() == "normal_k_search") normal_k_search_ = param.as_int();
+            else if (param.get_name() == "y_normal_tolerance") y_normal_tolerance_ = param.as_double();
+            else if (param.get_name() == "min_lateral_y") min_lateral_y_ = param.as_double();
+            else if (param.get_name() == "max_lateral_y") max_lateral_y_ = param.as_double();
+            else if (param.get_name() == "max_wall_height") max_wall_height_ = param.as_double();
+            else if (param.get_name() == "min_wall_height") min_wall_height_ = param.as_double();
+            else if (param.get_name() == "veto_grid_res") veto_grid_res_ = param.as_double();
+            else if (param.get_name() == "sor_mean_k") sor_mean_k_ = param.as_int();
+            else if (param.get_name() == "sor_stddev_mul_thresh") sor_stddev_mul_thresh_ = param.as_double();
+            else if (param.get_name() == "y_z_score_threshold") y_z_score_threshold_ = param.as_double();
+            else if (param.get_name() == "fill_resolution") fill_resolution_ = param.as_double();
+        }
+        return result;
+    }
 
-        double distance_threshold = this->get_parameter("distance_threshold").as_double();
-        double eps_angle_deg = this->get_parameter("eps_angle_deg").as_double();
-        double max_acceptable_angle_deg = this->get_parameter("max_acceptable_angle_deg").as_double();
-        double sor_mean_k = this->get_parameter("sor_mean_k").as_double();
-        double sor_std = this->get_parameter("sor_std").as_double();
-        int max_iterations = this->get_parameter("max_iterations").as_int();
+    void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+    {
+        if (msg->width * msg->height == 0) return;
 
-        // 1. Convert raw ROS msg directly to PCL FIRST
         pcl::PointCloud<pcl::PointXYZ>::Ptr raw_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::fromROSMsg(*msg, *raw_cloud);
-        if (raw_cloud->points.empty()) return;
+        if (raw_cloud->empty()) return;
 
-        // 2. Transform the raw PCL cloud
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
-        try {
-            geometry_msgs::msg::TransformStamped t = tf_buffer_->lookupTransform(
-                target_frame_, msg->header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.1));
-            Eigen::Isometry3d eigen_transform = tf2::transformToEigen(t);
-            pcl::transformPointCloud(*raw_cloud, *cloud, eigen_transform.cast<float>());
-        } catch (const tf2::TransformException & ex) {
-            RCLCPP_WARN(this->get_logger(), "TF Error: %s", ex.what());
-            return; 
+        // Seed_beed height (Z-Axis) PassThrough Filter (Lower Limit Only) 
+        pcl::PointCloud<pcl::PointXYZ>::Ptr z_filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::PassThrough<pcl::PointXYZ> pass_z;
+        pass_z.setInputCloud(raw_cloud);
+        pass_z.setFilterFieldName("z");
+        pass_z.setFilterLimits(min_wall_height_, std::numeric_limits<double>::max());
+        pass_z.filter(*z_filtered_cloud);
+
+        if (z_filtered_cloud->empty()) return;
+
+        // Lateral (Y-Axis) Boundary PassThrough Filter 
+        pcl::PointCloud<pcl::PointXYZ>::Ptr bounded_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::PassThrough<pcl::PointXYZ> pass_y;
+        pass_y.setInputCloud(z_filtered_cloud); 
+        pass_y.setFilterFieldName("y");
+        pass_y.setFilterLimits(min_lateral_y_, max_lateral_y_);
+        pass_y.filter(*bounded_cloud);
+
+        if (bounded_cloud->empty()) return;
+
+        // Create the Veto grid to eliminate tall and vertical noise 
+        std::unordered_set<int64_t> veto_grid;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr short_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+
+        for (const auto& pt : bounded_cloud->points) {
+            if (pt.z > max_wall_height_) {
+                int32_t bx = std::round(pt.x / veto_grid_res_);
+                int32_t by = std::round(pt.y / veto_grid_res_);
+                int64_t key = (static_cast<int64_t>(bx) << 32) | (static_cast<uint32_t>(by));
+                veto_grid.insert(key);
+            } else {
+                short_cloud->push_back(pt);
+            }
         }
 
-        // Publish transformed cloud for debugging
-        sensor_msgs::msg::PointCloud2 flat_msg;
-        pcl::toROSMsg(*cloud, flat_msg);
-        flat_msg.header.frame_id = target_frame_;
-        flat_msg.header.stamp = msg->header.stamp;
-        tf_publisher_->publish(flat_msg);
+        if (short_cloud->empty()) return;
 
-        // 3. PassThrough Filter: Isolate the area of interest (Crop high structures)
-        pcl::PassThrough<pcl::PointXYZ> pass;
-        pass.setInputCloud(cloud);
-        if (height_axis_ == Axis::X) pass.setFilterFieldName("x");
-        else if (height_axis_ == Axis::Y) pass.setFilterFieldName("y");
-        else pass.setFilterFieldName("z");
-        pass.setFilterLimits(-1.5, 0.8); // Adjust based on your sensor height to exclude canopy
-        pass.filter(*cloud);
+        // Surface Normal Estimation 
+        pcl::search::Search<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+        pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+        ne.setSearchMethod(tree);
+        ne.setInputCloud(short_cloud); 
+        ne.setKSearch(normal_k_search_);
+        ne.compute(*normals);
 
-        if (cloud->points.size() < 10) return;
-
-        // 4. Dual-RANSAC implementation
-        pcl::SACSegmentation<pcl::PointXYZ> seg;
-        seg.setOptimizeCoefficients(false);
-        seg.setModelType(pcl::SACMODEL_PARALLEL_PLANE); 
-        seg.setMethodType(pcl::SAC_RANSAC);    
-        seg.setMaxIterations(max_iterations); 
-        seg.setDistanceThreshold(distance_threshold); 
-        seg.setEpsAngle(eps_angle_deg * (M_PI / 180.0)); 
-
-        Eigen::Vector3f parallel_axis(1.0f, 1.0f, 1.0f);
-        Eigen::Vector3f perpendicular_axis(0.0f, 0.0f, 0.0f);
-        if (height_axis_ == Axis::Z) { parallel_axis[2] = 0.0f; perpendicular_axis[2] = 1.0f; }
-        else if (height_axis_ == Axis::Y){ parallel_axis[1] = 0.0f; perpendicular_axis[1] = 1.0f; }
-        else if (height_axis_ == Axis::X){ parallel_axis[0] = 0.0f; perpendicular_axis[0] = 1.0f; }
-        seg.setAxis(parallel_axis);
+        // Extract seedbed Walls & flattening 
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_3d(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_2d(new pcl::PointCloud<pcl::PointXYZ>());
         
-        pcl::ModelCoefficients::Ptr coefficients1(new pcl::ModelCoefficients());
-        pcl::PointIndices::Ptr inliers1(new pcl::PointIndices());
-        seg.setInputCloud(cloud);
-        seg.segment(*inliers1, *coefficients1);
+        for (size_t i = 0; i < short_cloud->points.size(); ++i) {
+            if (std::abs(normals->points[i].normal_y) >= y_normal_tolerance_) {
+                pcl::PointXYZ pt = short_cloud->points[i];
+                
+                int32_t bx = std::round(pt.x / veto_grid_res_);
+                int32_t by = std::round(pt.y / veto_grid_res_);
+                int64_t key = (static_cast<int64_t>(bx) << 32) | (static_cast<uint32_t>(by));
 
-        if (inliers1->indices.empty()) return;
-
-        float height1 = 0.0f;
-        for (int idx : inliers1->indices) height1 += get_axis_val(cloud->points[idx], height_axis_);
-        height1 /= inliers1->indices.size();
-
-        std::vector<bool> is_inlier1(cloud->points.size(), false);
-        for (int idx : inliers1->indices) is_inlier1[idx] = true;
-
-        pcl::IndicesPtr remaining_indices(new std::vector<int>);
-        for (size_t i = 0; i < cloud->points.size(); ++i) {
-            if (!is_inlier1[i]) remaining_indices->push_back(i);
-        }
-
-        pcl::ModelCoefficients::Ptr coefficients2(new pcl::ModelCoefficients());
-        pcl::PointIndices::Ptr inliers2(new pcl::PointIndices());
-        
-        if (remaining_indices->size() >= 10) {
-            seg.setIndices(remaining_indices);
-            seg.segment(*inliers2, *coefficients2);
-        }
-
-        pcl::ModelCoefficients::Ptr coefficients = coefficients1;
-        pcl::PointIndices::Ptr ground_inliers = inliers1;
-
-        if (!inliers2->indices.empty()) {
-            float height2 = 0.0f;
-            for (int idx : inliers2->indices) height2 += get_axis_val(cloud->points[idx], height_axis_);
-            height2 /= inliers2->indices.size();
-
-            if (height2 < height1) {
-                ground_inliers = inliers2;
-                coefficients = coefficients2;
+                if (veto_grid.find(key) == veto_grid.end()) {
+                    cloud_3d->push_back(pt);
+                    pt.z = 0.0f; 
+                    cloud_2d->push_back(pt);
+                }
             }
         }
         
-        // Manual Angle Validation
-        Eigen::Vector3f plane_normal(coefficients->values[0], coefficients->values[1], coefficients->values[2]);
-        plane_normal.normalize(); 
-        float dot_product = plane_normal.dot(perpendicular_axis);
-        float angle_rad = std::acos(std::abs(dot_product));
-        float angle_deg = angle_rad * (180.0f / M_PI);
-
-        if (angle_deg > max_acceptable_angle_deg) return; 
-
-        std_msgs::msg::Float32MultiArray coeff_msg;
-        coeff_msg.data = { coefficients->values[0], coefficients->values[1], coefficients->values[2], coefficients->values[3] };
-        coeff_publisher_->publish(coeff_msg);
-
-        // RViz Plane Visualization
-        visualization_msgs::msg::Marker plane_marker;
-        plane_marker.header.frame_id = target_frame_;
-        plane_marker.header.stamp = msg->header.stamp;
-        plane_marker.ns = "ground_plane";
-        plane_marker.id = 0;
-        plane_marker.type = visualization_msgs::msg::Marker::CUBE;
-        plane_marker.action = visualization_msgs::msg::Marker::ADD;
-
-        float d = coefficients->values[3];
-        plane_marker.pose.position.x = -d * plane_normal.x();
-        plane_marker.pose.position.y = -d * plane_normal.y();
-        plane_marker.pose.position.z = -d * plane_normal.z();
-
-        Eigen::Quaternionf q = Eigen::Quaternionf::FromTwoVectors(Eigen::Vector3f::UnitZ(), plane_normal);
-        plane_marker.pose.orientation.x = q.x();
-        plane_marker.pose.orientation.y = q.y();
-        plane_marker.pose.orientation.z = q.z();
-        plane_marker.pose.orientation.w = q.w();
-
-        plane_marker.scale.x = 10.0; plane_marker.scale.y = 10.0; plane_marker.scale.z = 0.01; 
-        plane_marker.color.r = 0.0f; plane_marker.color.g = 1.0f; plane_marker.color.b = 0.0f; plane_marker.color.a = 0.4f; 
-        plane_marker_publisher_->publish(plane_marker);
-
-        // Extract Ground Inliers
-        pcl::PointCloud<pcl::PointXYZ>::Ptr ground_cloud(new pcl::PointCloud<pcl::PointXYZ>());
-        pcl::ExtractIndices<pcl::PointXYZ> extract;
-        extract.setInputCloud(cloud);
-        extract.setIndices(ground_inliers);
-        extract.setNegative(false); 
-        extract.filter(*ground_cloud);
-
-        if (!ground_cloud->points.empty()) {
-            sensor_msgs::msg::PointCloud2 ground_msg;
-            pcl::toROSMsg(*ground_cloud, ground_msg);
-            ground_msg.header.frame_id = target_frame_;
-            ground_msg.header.stamp = msg->header.stamp; 
-            ground_publisher_->publish(ground_msg);
+        if (!cloud_3d->empty()) {
+            sensor_msgs::msg::PointCloud2 debug_msg;
+            pcl::toROSMsg(*cloud_3d, debug_msg);
+            debug_msg.header = msg->header;
+            debug_pub_->publish(debug_msg);
         }
 
-        // Extract Seedbeds / Objects (Outliers)
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_objects(new pcl::PointCloud<pcl::PointXYZ>());
-        extract.setNegative(true); 
-        extract.filter(*cloud_objects);
+        if (cloud_2d->empty()) return;
 
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_2d(new pcl::PointCloud<pcl::PointXYZ>());
-        *cloud_2d = *cloud_objects; 
-        for (auto& pt : cloud_2d->points) { set_axis_val(pt, height_axis_, 0.0f); }
-
-        // --- NEW PUBLISH BLOCK: Debugging the flattened 2D cloud ---
-        if (!cloud_2d->points.empty()) {
-            sensor_msgs::msg::PointCloud2 debug_2d_msg;
-            pcl::toROSMsg(*cloud_2d, debug_2d_msg);
-            debug_2d_msg.header.frame_id = target_frame_;
-            debug_2d_msg.header.stamp = msg->header.stamp; 
-            flat_2d_publisher_->publish(debug_2d_msg);
-        }
-        // -------------------------------------------------------------
-
+        //  SOR Filtering (noise cancle) 
         pcl::PointCloud<pcl::PointXYZ>::Ptr pruned_cloud_2d(new pcl::PointCloud<pcl::PointXYZ>());
-        if (!cloud_2d->points.empty()) {
-            pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
-            sor.setInputCloud(cloud_2d);
-            sor.setMeanK(sor_mean_k); 
-            sor.setStddevMulThresh(sor_std); 
-            sor.filter(*pruned_cloud_2d);
+        pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+        sor.setInputCloud(cloud_2d);
+        sor.setMeanK(sor_mean_k_);
+        sor.setStddevMulThresh(sor_stddev_mul_thresh_);
+        sor.filter(*pruned_cloud_2d);
+
+        if (pruned_cloud_2d->empty()) return;
+
+        //  Seed_bed wall Lateral Center (mean Y) Calculation
+        std::map<int, std::pair<float, float>> mean_map;
+        const float slice_res = 0.05f; 
+
+        for (const auto& pt : pruned_cloud_2d->points) {
+            int fwd_bin = std::round(pt.x / slice_res);
+            if (mean_map.find(fwd_bin) == mean_map.end()) {
+                mean_map[fwd_bin] = {pt.y, pt.y};
+            } else {
+                if (pt.y < mean_map[fwd_bin].first)  mean_map[fwd_bin].first = pt.y;
+                if (pt.y > mean_map[fwd_bin].second) mean_map[fwd_bin].second = pt.y;
+            }
         }
 
-        // Global Gap Filling Algorithm (Clustering Skipped)
-        pcl::PointCloud<pcl::PointXYZ>::Ptr filled_gaps_cloud(new pcl::PointCloud<pcl::PointXYZ>());
-        if (!pruned_cloud_2d->points.empty()) {
+        double sum_mid_x = 0.0;
+        double sum_mid_y = 0.0;
+        int valid_slices = 0;
+
+        for (const auto& kv : mean_map) {
+            float min_y = kv.second.first;
+            float max_y = kv.second.second;
+            
+            if ((max_y - min_y) > 0.20f) { // the 20cm represent the minimum distance for a left to right point cloud to be classified as a seedbed_wall 
+            
+                sum_mid_x += kv.first * slice_res;
+                sum_mid_y += (min_y + max_y) / 2.0;
+                valid_slices++;
+            }
+        }
+
+        if (valid_slices > 0) { 
+            double mean_x = sum_mid_x / valid_slices;
+            double mean_y = sum_mid_y / valid_slices;
+
+            // Lateral (Y-Axis) Statistical Outlier Removal
+            double sq_sum_y = 0.0;
+            for (const auto& pt : pruned_cloud_2d->points) {
+                sq_sum_y += (pt.y - mean_y) * (pt.y - mean_y);
+            }
+            double stddev_y = std::sqrt(sq_sum_y / pruned_cloud_2d->points.size());
+
+            pcl::PointCloud<pcl::PointXYZ>::Ptr y_filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+            for (const auto& pt : pruned_cloud_2d->points) {
+                if (std::abs(pt.y - mean_y) <= y_z_score_threshold_ * stddev_y) {
+                    y_filtered_cloud->push_back(pt);
+                }
+            }
+
+            if (y_filtered_cloud->empty()) return;
+
+            // Gap Filling 
+            pcl::PointCloud<pcl::PointXYZ>::Ptr filled_gaps_cloud(new pcl::PointCloud<pcl::PointXYZ>());
             Axis axis_forward, axis_lateral;
             if (height_axis_ == Axis::X) { axis_forward = Axis::Y; axis_lateral = Axis::Z; }
             else if (height_axis_ == Axis::Y) { axis_forward = Axis::X; axis_lateral = Axis::Z; }
             else { axis_forward = Axis::X; axis_lateral = Axis::Y; }
 
-            const float FILL_RESOLUTION = 0.01f; 
+            const float fill_res = static_cast<float>(fill_resolution_); 
             std::map<int, std::pair<float, float>> boundary_map;
 
-            for (const auto& pt : pruned_cloud_2d->points) {
+            for (const auto& pt : y_filtered_cloud->points) {
                 float fwd_val = get_axis_val(pt, axis_forward);
                 float lat_val = get_axis_val(pt, axis_lateral);
-                int fwd_bin = std::round(fwd_val / FILL_RESOLUTION);
+                int fwd_bin = std::round(fwd_val / fill_res);
 
                 if (boundary_map.find(fwd_bin) == boundary_map.end()) boundary_map[fwd_bin] = {lat_val, lat_val};
                 else {
@@ -302,44 +278,35 @@ private:
 
                 if ((max_lat - min_lat) < 0.10f) continue; 
 
-                float current_lat = min_lat + FILL_RESOLUTION;
+                float current_lat = min_lat + fill_res;
                 while (current_lat < max_lat) {
                     pcl::PointXYZ fill_pt;
-                    set_axis_val(fill_pt, axis_forward, fwd_bin * FILL_RESOLUTION);
+                    set_axis_val(fill_pt, axis_forward, fwd_bin * fill_res);
                     set_axis_val(fill_pt, axis_lateral, current_lat);
                     set_axis_val(fill_pt, height_axis_, 0.0f); 
                     filled_gaps_cloud->points.push_back(fill_pt);
-                    current_lat += FILL_RESOLUTION;
+                    current_lat += fill_res;
                 }
             }
             filled_gaps_cloud->width = filled_gaps_cloud->points.size();
             filled_gaps_cloud->height = 1;
             filled_gaps_cloud->is_dense = true;
-        }
 
-        // Final Publish
-        if (!filled_gaps_cloud->points.empty()) {
-            sensor_msgs::msg::PointCloud2 output_msg;
-            pcl::toROSMsg(*filled_gaps_cloud, output_msg);
-            output_msg.header.frame_id = target_frame_;
-            output_msg.header.stamp = msg->header.stamp; 
-            publisher_->publish(output_msg);
+            // Publish 
+            if (!filled_gaps_cloud->points.empty()) {
+                sensor_msgs::msg::PointCloud2 output_msg;
+                pcl::toROSMsg(*filled_gaps_cloud, output_msg);
+                output_msg.header = msg->header;
+                pub_->publish(output_msg);
+            }
         }
     }
-
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ground_publisher_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr tf_publisher_;
-    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr coeff_publisher_;
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr plane_marker_publisher_; 
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr flat_2d_publisher_; // Debug Publisher
 };
 
-int main(int argc, char * argv[])
+int main(int argc, char ** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<GroundSegmentationNode>());
+    rclcpp::spin(std::make_shared<SeedbedSegmentationNode>());
     rclcpp::shutdown();
     return 0;
 }

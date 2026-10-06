@@ -21,9 +21,12 @@ public:
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
+        
         sub_l_.subscribe(this, "/lidar_l/points", qos.get_rmw_qos_profile());
         sub_r_.subscribe(this, "/lidar_r/points", qos.get_rmw_qos_profile());
+
+        // sub_l_.subscribe(this, "/point_cloud_5", qos.get_rmw_qos_profile());
+        // sub_r_.subscribe(this, "/point_cloud_pi4", qos.get_rmw_qos_profile());
 
         // Setup Approximate Time Synchronizer
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
@@ -49,14 +52,18 @@ private:
             // 1. Get Transforms (tf2_ros handles caching natively in C++)
             auto tf_l = tf_buffer_->lookupTransform("base_link", msg_l->header.frame_id, tf2::TimePointZero);
             auto tf_r = tf_buffer_->lookupTransform("base_link", msg_r->header.frame_id, tf2::TimePointZero);
+            // auto tf_l = tf_buffer_->lookupTransform("map", msg_l->header.frame_id, tf2::TimePointZero);
+            // auto tf_r = tf_buffer_->lookupTransform("map", msg_r->header.frame_id, tf2::TimePointZero);
 
             // 2. Transform the raw ROS messages directly (Highly optimized by pcl_ros)
             sensor_msgs::msg::PointCloud2 msg_l_tf, msg_r_tf;
             pcl_ros::transformPointCloud("base_link", *msg_l, msg_l_tf, *tf_buffer_);
             pcl_ros::transformPointCloud("base_link", *msg_r, msg_r_tf, *tf_buffer_);
+            // pcl_ros::transformPointCloud("map", *msg_l, msg_l_tf, *tf_buffer_);
+            // pcl_ros::transformPointCloud("map", *msg_r, msg_r_tf, *tf_buffer_);
 
             // 3. Convert to PCL objects for instant merging
-            pcl::PointCloud<pcl::PointXYZI> pcl_l, pcl_r, pcl_fused;
+            pcl::PointCloud<pcl::PointXYZ> pcl_l, pcl_r, pcl_fused;
             pcl::fromROSMsg(msg_l_tf, pcl_l);
             pcl::fromROSMsg(msg_r_tf, pcl_r);
 
@@ -69,6 +76,7 @@ private:
             pcl::toROSMsg(pcl_fused, fused_msg);
             fused_msg.header.stamp = msg_l->header.stamp;
             fused_msg.header.frame_id = "base_link";
+            // fused_msg.header.frame_id = "map";
 
             pc_pub_->publish(fused_msg);
 

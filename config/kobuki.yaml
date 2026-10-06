@@ -1,0 +1,56 @@
+arducam_fusion_node:
+  ros__parameters:
+    voxel_leaf_size: 0.018             # The resolution of the 3D grid (meters). Increase to save CPU, decrease for finer detail.
+    enable_downsampling: true          # Toggle for the voxel filter.
+
+seedbed_segmentation_node:
+  ros__parameters:
+    # Physical Farm Dimensions
+    min_lateral_y: -0.35               # Left boundary (meters). 
+    max_lateral_y: 0.35                # Right boundary (meters).
+    min_wall_height: 0.05              # Ignores ground noise below this height (meters).
+    max_wall_height: 0.35              # Ignores leaves/canopy above this height (meters).
+    
+    # Feature & Noise Tuning
+    y_normal_tolerance: 0.7            # Threshold for verticality. Lower values strictly require flat walls; higher values accept slanted walls.
+    sor_mean_k: 80                     # Number of neighbors for noise filtering. Lower preserves sparse walls, higher removes more noise.
+    sor_stddev_mul_thresh: 1.0         # Strictness of noise filter. Loosen to stop deleting legitimate wall patches.
+    y_z_score_threshold: 2.5           # Allowable variance in wall width. Widened to 2.5 to accept both walls simultaneously.
+    normal_k_search: 80                # Points used to calculate point clouds surface normal.
+    
+    # Algorithmic Internals
+    veto_grid_res: 0.1                 # Resolution of the 2D shadow mask protecting the driveable path.
+    fill_resolution: 0.01              # Gap-filling density.
+    min_z_threshold: 0                 # Redundant hard floor cutoff.
+
+path_extraction_node:
+  ros__parameters:
+    # Targeting 
+    lookahead_x: 0.15                  # The target distance (meters) ahead of the robot. Increase for smoother, wider turns; decrease for sharp reactions.
+    forward_limit: 0.3                 # Stopping distance of the algorithm to end calculating path
+    forward_start: 0.0                 # Starting distance of the algorithm to start calculating path
+    
+    # Path Geometry
+    max_slice_width: 1.2               # Maximum valid path width (meters). Slices wider than this are discarded as intersections/gaps.
+    slice_depth: 0.02                  # Thickness of each scanning slice (meters).
+    
+    # Failsafes & Viz
+    min_valid_centroids: 2             # Minimum points required to fit a curve. If below this, the robot holds its last angle.
+    marker_half_span: 1.0              # Visual length of the RViz boundary markers.
+
+angular_pid_node:
+  ros__parameters:
+  
+    kp: 0.2                            # Proportional gain. Increase if the robot is sluggish; decrease if it weaves/oscillates.
+    kd: 0.6                            # Derivative gain. Increase to dampen overshoot when approaching the center line.
+    
+    # Speed Limits & Dynamics
+    linear_x: 0.1                      # Maximum forward speed (m/s) when driving perfectly straight.
+    speed_reduction_factor: 2.0        # Cornering brake strength. Higher values force the robot to slow down aggressively on sharp curves.
+    min_linear_x: 0.01                 # Absolute minimum speed (m/s) during a sharp turn to prevent stalling.
+    
+    # Digital Filters & Internals
+    angular_smoothing: 0.2             # Alpha filter for steering (0.0 to 1.0). Lower = smoother but delayed; Higher = instant but jerky.
+    speed_smoothing: 0.1               # Alpha filter for acceleration/braking.
+    deadband: 0.02                     # Minimum change in command required to trigger a motor update.
+    velocity_topic: "/cmd_vel"         # Target topic.
