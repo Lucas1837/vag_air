@@ -14,14 +14,15 @@ public:
     CameraFusionNode() : Node("camera_fusion_node") {
         this->declare_parameter<bool>("enable_downsampling", true);
         this->declare_parameter<double>("voxel_leaf_size", 0.025); 
-
+        // QoS Profile for high-bandwidth sensor data
         rclcpp::QoS qos = rclcpp::SensorDataQoS();
 
         pc_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/point_cloud", qos);
         
         sub_pi5_.subscribe(this, "/point_cloud_pi5", qos.get_rmw_qos_profile());
         sub_pi4_.subscribe(this, "/point_cloud_pi4", qos.get_rmw_qos_profile());
-
+        
+        // Setup Approximate Time Synchronizer
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
             SyncPolicy(50), sub_pi5_, sub_pi4_);
         sync_->registerCallback(std::bind(&CameraFusionNode::sync_callback, this, std::placeholders::_1, std::placeholders::_2));
