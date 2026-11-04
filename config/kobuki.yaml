@@ -54,4 +54,4 @@ angular_pid_node:
     speed_smoothing: 0.1               # Alpha filter for acceleration/braking.
     deadband: 0.02                     # Minimum change in command required to trigger a motor update.
     velocity_topic: "/cmd_vel"         # Target topic.
-    watchdog_timeout: 0.5              #timeout time (s) when signal is lost
+    watchdog_timeout: 2              #timeout time (s) when signal is lost
