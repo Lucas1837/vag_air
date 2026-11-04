@@ -75,7 +75,6 @@ private:
 
         // PD math
         double p_term = kp * current_error;
-
         double derivative = (current_error - previous_error_) / dt;
         double d_term = kd * derivative;
 
